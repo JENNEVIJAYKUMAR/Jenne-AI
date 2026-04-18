@@ -1,6 +1,7 @@
 import json
 import time
 from datetime import datetime
+from typing import List, Dict
 
 import requests
 import streamlit as st
@@ -9,7 +10,7 @@ import streamlit as st
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(
-    page_title="Jenne AI",
+    page_title="Vijay Jenne AI",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -18,48 +19,51 @@ st.set_page_config(
 # ==========================================
 # CONFIG
 # ==========================================
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:3b"
-KEEP_ALIVE = "20m"
+HF_API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct"
+HF_API_KEY = st.secrets.get("HF_API_KEY", "")
 
-SYSTEM_PROMPT = """
-You are Jenne AI, a premium local AI model.
-
-Always answer in this exact format:
-
-Relevant content:
-- Give a clear and direct explanation in 3 to 6 lines.
-
-Realtime example:
-- Give one practical real-world example in 2 to 4 lines.
-
-Suggested content:
-- Give 3 short helpful bullet points for next learning or action.
-
-Rules:
-- Keep answers concise, clean, and practical.
-- Avoid long essays.
-- Avoid repeating the question.
-- Do not say you are an assistant.
-- Refer to yourself as an AI model when needed.
-- Make output user-friendly and well structured.
-"""
-
-MODEL_OPTIONS = {
-    "temperature": 0.4,
+# Tighter params for deterministic, structured output
+HF_PARAMS = {
+    "max_new_tokens": 180,
+    "temperature": 0.3,
     "top_p": 0.9,
-    "num_predict": 120,
-    "num_ctx": 1024,
+    "repetition_penalty": 1.2,
+    "return_full_text": False,
 }
 
-MAX_HISTORY_MESSAGES = 6
+MAX_HISTORY_MESSAGES = 4
+REQUEST_TIMEOUT = 45
+MAX_RETRIES = 2
+
+SYSTEM_PROMPT = """
+You are Vijay Jenne AI, a premium AI model.
+
+STRICT OUTPUT FORMAT (MANDATORY):
+
+Relevant content:
+- Explain clearly in 3 to 5 lines.
+
+Realtime example:
+- Give exactly one practical real-world example in 2 to 3 lines.
+
+Suggested content:
+- Give exactly 3 bullet points.
+
+RULES:
+- Do NOT skip any section
+- Do NOT add extra sections
+- Do NOT change headings
+- Keep output concise
+- No introductions or conclusions
+- No markdown headings (#, ##)
+"""
 
 # ==========================================
 # SESSION INIT
 # ==========================================
 def init_session():
     if "chats" not in st.session_state:
-        first_chat_id = f"chat_{int(time.time() * 1000)}"
+        first_chat_id = f"chat_{int(time.time()*1000)}"
         st.session_state.chats = {
             first_chat_id: {
                 "title": "New Chat",
@@ -71,14 +75,13 @@ def init_session():
         }
         st.session_state.current_chat = first_chat_id
 
-    if "stop_generation" not in st.session_state:
-        st.session_state.stop_generation = False
-
-    if "pending_prompt" not in st.session_state:
-        st.session_state.pending_prompt = None
-
-    if "rename_mode" not in st.session_state:
-        st.session_state.rename_mode = False
+    for key, default in [
+        ("stop_generation", False),
+        ("pending_prompt", None),
+        ("rename_mode", False),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
 
 init_session()
@@ -87,7 +90,7 @@ init_session()
 # HELPERS
 # ==========================================
 def create_new_chat():
-    chat_id = f"chat_{int(time.time() * 1000)}"
+    chat_id = f"chat_{int(time.time()*1000)}"
     st.session_state.chats[chat_id] = {
         "title": "New Chat",
         "messages": [],
@@ -104,12 +107,10 @@ def create_new_chat():
 def delete_chat(chat_id: str):
     if chat_id in st.session_state.chats:
         del st.session_state.chats[chat_id]
-
     if not st.session_state.chats:
         create_new_chat()
     else:
         st.session_state.current_chat = list(st.session_state.chats.keys())[-1]
-
     st.session_state.stop_generation = False
     st.session_state.rename_mode = False
     st.session_state.pending_prompt = None
@@ -135,271 +136,173 @@ def rename_current_chat(new_title: str):
 
 def generate_chat_title(user_message: str) -> str:
     cleaned = " ".join(user_message.strip().split())
-    if len(cleaned) <= 32:
-        return cleaned
-    return cleaned[:32].rstrip() + "..."
+    return cleaned if len(cleaned) <= 32 else cleaned[:32].rstrip() + "..."
 
 
 def export_current_chat() -> str:
     current_chat = st.session_state.chats[st.session_state.current_chat]
     messages = current_chat["messages"]
-
     if not messages:
         return "No chat to export."
-
-    lines = []
-    lines.append("Jenne AI Chat Export")
-    lines.append("=" * 60)
-    lines.append(f"Title: {current_chat['title']}")
-    lines.append(f"Created: {current_chat.get('created_at', '-')}")
-    lines.append(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("")
-
+    lines = [
+        "Vijay Jenne AI Chat Export",
+        "=" * 60,
+        f"Title: {current_chat['title']}",
+        f"Created: {current_chat.get('created_at', '-')}",
+        f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
     for msg in messages:
-        role = "You" if msg["role"] == "user" else "Jenne AI"
-        lines.append(f"{role}:")
-        lines.append(msg["content"])
-        lines.append("-" * 60)
-
+        role = "You" if msg["role"] == "user" else "Vijay Jenne AI"
+        lines += [f"{role}:", msg["content"], "-" * 60]
     return "\n".join(lines)
 
 
-def build_ollama_messages(chat_messages: list[dict]) -> list[dict]:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    recent = chat_messages[-MAX_HISTORY_MESSAGES:]
-
-    for msg in recent:
-        messages.append(
-            {
-                "role": "assistant" if msg["role"] == "assistant" else "user",
-                "content": msg["content"],
-            }
-        )
-
-    return messages
+def build_prompt(chat_messages: List[Dict]) -> str:
+    prompt = f"{SYSTEM_PROMPT}\n\nConversation:\n\n"
+    for msg in chat_messages[-MAX_HISTORY_MESSAGES:]:
+        role = "User" if msg["role"] == "user" else "AI"
+        prompt += f"{role}: {msg['content']}\n"
+    prompt += "\nAI:"
+    return prompt
 
 
-def stream_ollama_response(chat_messages: list[dict]):
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": build_ollama_messages(chat_messages),
-        "stream": True,
-        "keep_alive": KEEP_ALIVE,
-        "options": MODEL_OPTIONS,
+def hf_generate(prompt: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json",
     }
+    payload = {"inputs": prompt, "parameters": HF_PARAMS}
 
-    try:
-        with requests.post(
-            OLLAMA_CHAT_URL,
-            json=payload,
-            stream=True,
-            timeout=(10, 180),
-        ) as response:
-            if response.status_code != 200:
-                yield f"Error: Ollama returned status code {response.status_code}"
-                return
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                HF_API_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data[0].get("generated_text", "").strip()
+                return str(data)
+            else:
+                last_err = f"API error {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(1.5 * (attempt + 1))
+    return f"Error: {last_err or 'Unknown error'}"
 
-            full_text = ""
 
-            for line in response.iter_lines():
-                if st.session_state.stop_generation:
-                    break
+def enforce_structure(text: str) -> str:
+    """Clean + enforce the 3-section format deterministically."""
+    t = (text or "").strip()
+    t = t.replace("AI:", "").strip()
 
-                if not line:
-                    continue
+    # Quick happy path
+    if all(h in t for h in ["Relevant content:", "Realtime example:", "Suggested content:"]):
+        return t
 
-                try:
-                    data = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
+    # Fallback construction
+    body = t.split("\n")
+    body = [b.strip() for b in body if b.strip()]
+    short = " ".join(body)[:220] if body else "Answer generated."
 
-                chunk = data.get("message", {}).get("content", "")
-                if chunk:
-                    full_text += chunk
-                    yield full_text
+    return f"""Relevant content:
+- {short}
 
-                if data.get("done", False):
-                    break
+Realtime example:
+- Example: Applying this in a real app shows the concept working in practice.
 
-    except requests.exceptions.ConnectionError:
-        yield "Error: Could not connect to Ollama. Make sure Ollama is running."
-    except requests.exceptions.Timeout:
-        yield "Error: Response timed out. Try a smaller prompt or restart Ollama."
-    except Exception as exc:
-        yield f"Error: {str(exc)}"
+Suggested content:
+- Explore related concepts
+- Try another query
+- Refine your prompt
+"""
+
+
+def safe_check_prompt(p: str) -> bool:
+    """Basic guardrail for obviously unsafe requests (extend as needed)."""
+    blocked = ["malware", "exploit", "illegal", "harm"]
+    return not any(b in p.lower() for b in blocked)
 
 
 # ==========================================
-# STYLING
+# STYLING (Premium)
 # ==========================================
 st.markdown(
     """
-    <style>
-    :root {
-        --text: #f8fafc;
-        --muted: #94a3b8;
-        --border: rgba(255,255,255,0.08);
-        --gold: #f8d66d;
-        --gold-soft: rgba(248, 214, 109, 0.16);
-        --blue-glow: rgba(96, 165, 250, 0.18);
-    }
-
-    .stApp {
-        background:
-            radial-gradient(circle at top, #1a2747 0%, #0b1327 35%, #04070f 100%);
-        color: var(--text);
-    }
-
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f172a 0%, #0a1020 100%);
-        border-right: 1px solid var(--border);
-    }
-
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 7rem;
-        max-width: 1100px;
-    }
-
-    .center-wrap {
-        text-align: center;
-        margin-bottom: 1.2rem;
-    }
-
-    .hero-badge {
-        display: inline-block;
-        padding: 0.48rem 1rem;
-        border-radius: 999px;
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.10);
-        color: #dbeafe;
-        font-size: 0.88rem;
-        letter-spacing: 0.02em;
-        margin-bottom: 0.9rem;
-        box-shadow: 0 0 24px rgba(255,255,255,0.03);
-    }
-
-    .brand-title {
-        font-size: 3rem;
-        font-weight: 800;
-        letter-spacing: -0.03em;
-        line-height: 1.05;
-        margin-bottom: 0.35rem;
-        background: linear-gradient(90deg, #ffffff 0%, #f8d66d 45%, #93c5fd 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-        text-shadow: 0 0 30px rgba(255,255,255,0.05);
-    }
-
-    .brand-subtitle {
-        color: #a5b4fc;
-        font-size: 1.02rem;
-        font-weight: 500;
-        margin-top: 0.15rem;
-    }
-
-    .empty-title {
-        text-align: center;
-        color: white;
-        font-size: 2.1rem;
-        font-weight: 750;
-        margin-top: 5rem;
-        margin-bottom: 0.55rem;
-        letter-spacing: -0.02em;
-    }
-
-    .empty-subtitle {
-        text-align: center;
-        color: #94a3b8;
-        font-size: 1rem;
-        max-width: 760px;
-        margin: 0 auto 2rem auto;
-        line-height: 1.6;
-    }
-
-    .sidebar-head {
-        color: #94a3b8;
-        font-size: 0.82rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        margin: 1rem 0 0.5rem 0;
-    }
-
-    .footer-note {
-        color: #94a3b8;
-        font-size: 0.92rem;
-        margin-top: 0.45rem;
-    }
-
-    .tiny-note {
-        color: #cbd5e1;
-        font-size: 0.85rem;
-        margin-top: 0.2rem;
-    }
-
-    .stButton > button,
-    div[data-testid="stDownloadButton"] > button {
-        width: 100%;
-        border-radius: 16px;
-        padding: 0.74rem 0.95rem;
-        border: 1px solid rgba(255,255,255,0.09);
-        background: rgba(255,255,255,0.04);
-        color: white;
-        font-weight: 600;
-        transition: 0.2s ease;
-    }
-
-    .stButton > button:hover,
-    div[data-testid="stDownloadButton"] > button:hover {
-        background: rgba(255,255,255,0.08);
-        border-color: rgba(255,255,255,0.16);
-        box-shadow: 0 0 20px rgba(96, 165, 250, 0.08);
-    }
-
+<style>
+:root {
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --border: rgba(255,255,255,0.08);
+}
+.stApp {
+    background:
+        radial-gradient(circle at top, #1a2747 0%, #0b1327 35%, #04070f 100%);
+    color: var(--text);
+}
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f172a 0%, #0a1020 100%);
+    border-right: 1px solid var(--border);
+}
+.block-container {
+    padding-top: 1rem;
+    padding-bottom: 7rem;
+    max-width: 1100px;
+}
+.center-wrap { text-align: center; margin-bottom: 1.2rem; }
+.hero-badge {
+    display: inline-block; padding: 0.48rem 1rem; border-radius: 999px;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10);
+    color: #dbeafe; font-size: 0.88rem; margin-bottom: 0.9rem;
+}
+.brand-title {
+    font-size: 3rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.05;
+    background: linear-gradient(90deg, #ffffff 0%, #f8d66d 45%, #93c5fd 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.brand-subtitle { color: #a5b4fc; font-size: 1.02rem; }
+.empty-title {
+    text-align:center; color:white; font-size:2.1rem; font-weight:750;
+    margin-top:5rem; margin-bottom:0.55rem;
+}
+.empty-subtitle {
+    text-align:center; color:#94a3b8; font-size:1rem;
+    max-width:760px; margin:0 auto 2rem auto;
+}
+.sidebar-head {
+    color:#94a3b8; font-size:0.82rem; font-weight:700;
+    letter-spacing:0.08em; margin:1rem 0 0.5rem 0;
+}
+.footer-note { color:#94a3b8; font-size:0.92rem; margin-top:0.45rem; }
+.tiny-note { color:#cbd5e1; font-size:0.85rem; margin-top:0.2rem; }
+.stButton > button,
+div[data-testid="stDownloadButton"] > button {
+    width:100%; border-radius:16px; padding:0.74rem 0.95rem;
+    border:1px solid rgba(255,255,255,0.09);
+    background: rgba(255,255,255,0.04); color:white; font-weight:600;
+}
+.stButton > button:hover,
+div[data-testid="stDownloadButton"] > button:hover {
+    background: rgba(255,255,255,0.08);
+    border-color: rgba(255,255,255,0.16);
+}
+div[data-testid="stChatInput"] {
+    position: fixed;
+    left: max(21rem, calc((100vw - 1100px) / 2 + 1rem));
+    right: 2rem; bottom: 1.25rem; z-index: 999;
+    background: rgba(2, 6, 23, 0.74);
+    backdrop-filter: blur(14px);
+    border-radius: 18px; padding-top: 0.25rem;
+}
+@media (max-width: 900px) {
     div[data-testid="stChatInput"] {
-        position: fixed;
-        left: max(21rem, calc((100vw - 1100px) / 2 + 1rem));
-        right: 2rem;
-        bottom: 1.25rem;
-        z-index: 999;
-        background: rgba(2, 6, 23, 0.74);
-        backdrop-filter: blur(14px);
-        border-radius: 18px;
-        padding-top: 0.25rem;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.28);
+        position: static; background: transparent; backdrop-filter: none;
     }
-
-    @media (max-width: 1200px) {
-        div[data-testid="stChatInput"] {
-            left: 21rem;
-            right: 1rem;
-        }
-    }
-
-    @media (max-width: 900px) {
-        div[data-testid="stChatInput"] {
-            position: static;
-            left: auto;
-            right: auto;
-            bottom: auto;
-            background: transparent;
-            backdrop-filter: none;
-            padding-top: 0;
-            box-shadow: none;
-        }
-
-        .brand-title {
-            font-size: 2.3rem;
-        }
-
-        .empty-title {
-            font-size: 1.7rem;
-            margin-top: 3rem;
-        }
-    }
-    </style>
-    """,
+}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
@@ -407,7 +310,7 @@ st.markdown(
 # SIDEBAR
 # ==========================================
 with st.sidebar:
-    st.markdown("## ✨ Jenne AI")
+    st.markdown("## ✨ Vijay Jenne AI")
     st.markdown(
         '<div class="footer-note">Premium local AI model by Vijay Kumar Jenne</div>',
         unsafe_allow_html=True,
@@ -447,13 +350,11 @@ with st.sidebar:
     for chat_id in list(st.session_state.chats.keys())[::-1]:
         chat = st.session_state.chats[chat_id]
         col1, col2 = st.columns([4, 1])
-
         with col1:
             if st.button(chat["title"], key=f"select_{chat_id}", use_container_width=True):
                 st.session_state.current_chat = chat_id
                 st.session_state.rename_mode = False
                 st.rerun()
-
         with col2:
             if st.button("✕", key=f"delete_{chat_id}", use_container_width=True):
                 delete_chat(chat_id)
@@ -466,7 +367,7 @@ with st.sidebar:
         st.download_button(
             label="⬇ Export",
             data=export_current_chat(),
-            file_name="jenne_ai_chat.txt",
+            file_name="vijay_jenne_ai_chat.txt",
             mime="text/plain",
             use_container_width=True,
         )
@@ -481,17 +382,14 @@ with st.sidebar:
         )
 
     st.markdown("---")
-    st.markdown(f"**Model:** `{OLLAMA_MODEL}`")
-    st.markdown(f"**Keep alive:** `{KEEP_ALIVE}`")
-
+    st.markdown(f"**Model:** `{HF_API_URL.split('/')[-1]}`")
     if current_chat.get("last_response_time") is not None:
         st.markdown(
             f'<div class="tiny-note">Last response time: {current_chat["last_response_time"]:.2f}s</div>',
             unsafe_allow_html=True,
         )
-
     st.markdown(
-        '<div class="footer-note">Powered locally with Ollama • Fast private inference</div>',
+        '<div class="footer-note">Powered by Hugging Face • Cloud inference</div>',
         unsafe_allow_html=True,
     )
 
@@ -500,14 +398,14 @@ with st.sidebar:
 # ==========================================
 st.markdown(
     """
-    <div class="center-wrap">
-        <div class="hero-badge">Premium Local AI Experience</div>
-        <div class="brand-title">Jenne AI</div>
-        <div class="brand-subtitle">
-            Intelligent. Clean. Structured. Practical.
-        </div>
+<div class="center-wrap">
+    <div class="hero-badge">Premium AI Experience</div>
+    <div class="brand-title">Vijay Jenne AI</div>
+    <div class="brand-subtitle">
+        Intelligent. Clean. Structured. Practical.
     </div>
-    """,
+</div>
+""",
     unsafe_allow_html=True,
 )
 
@@ -518,9 +416,9 @@ messages = current_chat["messages"]
 # EMPTY STATE
 # ==========================================
 if not messages:
-    st.markdown('<div class="empty-title">How can Jenne AI help today?</div>', unsafe_allow_html=True)
+    st.markdown('<div class="empty-title">How can Vijay Jenne AI help today?</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="empty-subtitle">A premium local AI model built for clean, structured, and practical answers.</div>',
+        '<div class="empty-subtitle">Cloud-ready AI with strict structured outputs.</div>',
         unsafe_allow_html=True,
     )
 
@@ -529,14 +427,14 @@ if not messages:
 # ==========================================
 for msg in messages:
     with st.chat_message("user" if msg["role"] == "user" else "assistant"):
-        label = "You" if msg["role"] == "user" else "Jenne AI"
+        label = "You" if msg["role"] == "user" else "Vijay Jenne AI"
         st.markdown(f"**{label}**")
         st.markdown(msg["content"])
 
 # ==========================================
 # INPUT
 # ==========================================
-typed_prompt = st.chat_input("Message Jenne AI...")
+typed_prompt = st.chat_input("Message Vijay Jenne AI...")
 final_prompt = typed_prompt or st.session_state.pending_prompt
 
 # ==========================================
@@ -545,46 +443,49 @@ final_prompt = typed_prompt or st.session_state.pending_prompt
 if final_prompt:
     st.session_state.pending_prompt = None
 
-    if current_chat["title"] == "New Chat":
-        current_chat["title"] = generate_chat_title(final_prompt)
+    if not safe_check_prompt(final_prompt):
+        with st.chat_message("assistant"):
+            st.markdown("**Vijay Jenne AI**")
+            st.error("Request blocked by safety filter.")
+    else:
+        if current_chat["title"] == "New Chat":
+            current_chat["title"] = generate_chat_title(final_prompt)
 
-    current_chat["messages"].append({"role": "user", "content": final_prompt})
+        current_chat["messages"].append({"role": "user", "content": final_prompt})
 
-    with st.chat_message("user"):
-        st.markdown("**You**")
-        st.markdown(final_prompt)
+        with st.chat_message("user"):
+            st.markdown("**You**")
+            st.markdown(final_prompt)
 
-    with st.chat_message("assistant"):
-        st.markdown("**Jenne AI**")
+        with st.chat_message("assistant"):
+            st.markdown("**Vijay Jenne AI**")
 
-        stop_col1, stop_col2 = st.columns([1, 6])
-        with stop_col1:
-            if st.button("⏹ Stop", key="stop_generation_live"):
-                st.session_state.stop_generation = True
+            stop_col1, _ = st.columns([1, 6])
+            with stop_col1:
+                if st.button("⏹ Stop", key="stop_generation_live"):
+                    st.session_state.stop_generation = True
 
-        response_placeholder = st.empty()
-        timer_placeholder = st.empty()
+            response_placeholder = st.empty()
+            timer_placeholder = st.empty()
 
-        full_response = ""
-        start_time = time.perf_counter()
+            start = time.perf_counter()
 
-        for partial in stream_ollama_response(current_chat["messages"]):
-            full_response = partial
-            elapsed = time.perf_counter() - start_time
-            response_placeholder.markdown(full_response + "▌")
-            timer_placeholder.caption(f"Generating… {elapsed:.2f}s")
+            # Build + call HF
+            prompt = build_prompt(current_chat["messages"])
+            raw = hf_generate(prompt)
 
-        total_time = time.perf_counter() - start_time
-        final_text = full_response.strip()
+            if st.session_state.stop_generation:
+                final_text = "[Generation stopped]"
+            else:
+                final_text = enforce_structure(raw)
 
-        if st.session_state.stop_generation:
-            final_text = final_text + "\n\n[Generation stopped]" if final_text else "[Generation stopped]"
+            elapsed = time.perf_counter() - start
 
-        response_placeholder.markdown(final_text)
-        timer_placeholder.caption(f"Completed in {total_time:.2f}s")
+            response_placeholder.markdown(final_text)
+            timer_placeholder.caption(f"Completed in {elapsed:.2f}s")
 
-        current_chat["messages"].append({"role": "assistant", "content": final_text})
-        current_chat["last_response"] = final_text
-        current_chat["last_response_time"] = total_time
+            current_chat["messages"].append({"role": "assistant", "content": final_text})
+            current_chat["last_response"] = final_text
+            current_chat["last_response_time"] = elapsed
 
-        st.session_state.stop_generation = False
+            st.session_state.stop_generation = False
