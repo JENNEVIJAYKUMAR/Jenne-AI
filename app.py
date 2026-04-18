@@ -19,7 +19,7 @@ st.set_page_config(
 # ==========================================
 # CONFIG
 # ==========================================
-HF_API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct"
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
 HF_API_KEY = st.secrets.get("HF_API_KEY", "")
 
 # Tighter params for deterministic, structured output
